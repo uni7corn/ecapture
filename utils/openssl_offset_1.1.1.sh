@@ -44,6 +44,9 @@ function run() {
   sslVerMap["q"]="j"
   sslVerMap["r"]="j"
   sslVerMap["s"]="j"
+  sslVerMap["u"]="j"
+  sslVerMap["v"]="j"
+  sslVerMap["w"]="j"
 
 
 #  exit 0
@@ -73,7 +76,14 @@ function run() {
     else
       unset flags
     fi
-    clang ${flags} -I include/ -I . offset.c -o offset
+
+    if [[ $ver == [a-c] ]]; then
+      flags_lcl="-DBIO_LCL"
+    else
+      unset flags_lcl
+    fi
+
+    clang ${flags} ${flags_lcl} -I include/ -I . offset.c -o offset
 
     echo -e "#ifndef ECAPTURE_${header_define}" >${header_file}
     echo -e "#define ECAPTURE_${header_define}\n" >>${header_file}

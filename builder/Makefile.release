@@ -1,36 +1,22 @@
+include variables.mk
+include functions.mk
+
 #
 # Responsible for creating ecapture snapshots for testing and releasing
 #
 
 .PHONY: all
 all: help
-release: snapshot snapshot_android publish
+release: snapshot build_deb snapshot_android
 
 #
 # make
 #
 
 .ONESHELL:
-SHELL = /bin/sh
+SHELL = /bin/bash
 
 MAKEFLAGS += --no-print-directory
-
-#
-# tools
-#
-
-CMD_CHECKSUM ?= sha256sum
-CMD_GITHUB ?= gh
-CMD_TAR ?= tar
-CMD_GIT ?= git
-CMD_RM ?= rm
-CMD_TOUCH ?= touch
-CMD_MKDIR ?= mkdir
-CMD_MV ?= mv
-CMD_CP ?= cp
-
-UNAME_M := $(shell uname -m)
-SNAPSHOT_VERSION ?= $(shell git rev-parse HEAD)
 
 .ONESHELL:
 .check_%:
@@ -49,17 +35,7 @@ SNAPSHOT_VERSION ?= $(shell git rev-parse HEAD)
 
 .PHONY: env
 env:
-	@echo ---------------------------------------
-	@echo "CMD_CHECKSUM          $(CMD_CHECKSUM)"
-	@echo "CMD_GIT               $(CMD_GIT)"
-	@echo "CMD_GITHUB            $(CMD_GITHUB)"
-	@echo "CMD_TAR               $(CMD_TAR)"
-	@echo "CMD_TOUCH             $(CMD_TOUCH)"
-	@echo "CMD_RM                $(CMD_RM)"
-	@echo "CMD_MKDIR             $(CMD_MKDIR)"
-	@echo ---------------------------------------
-	@echo "SNAPSHOT_VERSION      $(SNAPSHOT_VERSION)"
-	@echo ---------------------------------------
+	DEBUG=$(DEBUG) ANDROID=$(ANDROID) CROSS_ARCH=$(CROSS_ARCH) SNAPSHOT_VERSION=$(SNAPSHOT_VERSION) $(CMD_MAKE) env
 
 #
 # usage
@@ -106,36 +82,15 @@ help:
 
 .PHONY: .check_tree
 .check_tree:
-#
 	@if [ ! -d ./builder ]; then
 		echo "you must be in the root directory"
 		exit 1
 	fi
 
-#
-# output dir
-#
-
-OUTPUT_DIR = ./bin
-TAR_DIR = ecapture-$(SNAPSHOT_VERSION)-linux-$(UNAME_M)
-TAR_DIR_ANDROID = ecapture-$(SNAPSHOT_VERSION)-android-$(UNAME_M)
-
-# from CLI args.
-RELEASE_NOTES ?= $(OUTPUT_DIR)/release_notes.txt
-
 $(OUTPUT_DIR):
-#
 	$(CMD_MKDIR) -p $@
-#	$(CMD_TOUCH) $(RELEASE_NOTES)
 
-#
-# Create a release snapshot
-#
-
-OUT_ARCHIVE := $(OUTPUT_DIR)/$(TAR_DIR).tar.gz
-OUT_ARCHIVE_ANDROID := $(OUTPUT_DIR)/$(TAR_DIR_ANDROID).tar.gz
-OUT_CHECKSUMS := $(OUTPUT_DIR)/checksum-$(SNAPSHOT_VERSION).txt
-
+# snapshot Linux non-CO-RE version, and non-CO-RE only on Linux OS.
 .PHONY: snapshot
 snapshot: \
 	$(OUTPUT_DIR) \
@@ -143,22 +98,8 @@ snapshot: \
 	.check_$(CMD_TAR) \
 	.check_$(CMD_CHECKSUM) \
 	.check_$(CMD_GITHUB)
-
-	# build binaries
-	$(MAKE) clean
-	$(MAKE) nocore
-	# create the tar ball and checksum files
-	$(CMD_MKDIR) -p $(TAR_DIR)
-	$(CMD_CP) LICENSE $(TAR_DIR)/LICENSE
-	$(CMD_CP) CHANGELOG.md $(TAR_DIR)/CHANGELOG.md
-	$(CMD_CP) README.md $(TAR_DIR)/README.md
-	$(CMD_CP) README_CN.md $(TAR_DIR)/README_CN.md
-	$(CMD_MV) $(OUTPUT_DIR)/ecapture $(TAR_DIR)/ecapture
-	$(CMD_CP) $(RELEASE_NOTES) $(OUTPUT_DIR)/release_notes.txt
-	$(CMD_TAR)  -czf $(OUT_ARCHIVE) $(TAR_DIR)
-	cd $(OUTPUT_DIR)
-	$(CMD_CHECKSUM) $(TAR_DIR).tar.gz > ./../$(OUT_CHECKSUMS)
-	cd ../
+	$(call allow-override,ANDROID,0)
+	$(call release_tar,linux,)
 
 .PHONY: snapshot_android
 snapshot_android: \
@@ -167,36 +108,44 @@ snapshot_android: \
 	.check_$(CMD_TAR) \
 	.check_$(CMD_CHECKSUM) \
 	.check_$(CMD_GITHUB)
-
-	# build binaries
-	$(MAKE) clean
-	ANDROID=1 $(MAKE) nocore
-	# create the tar ball and checksum files
-	$(CMD_MKDIR) -p $(TAR_DIR_ANDROID)
-	$(CMD_CP) LICENSE $(TAR_DIR_ANDROID)/LICENSE
-	$(CMD_CP) CHANGELOG.md $(TAR_DIR_ANDROID)/CHANGELOG.md
-	$(CMD_CP) README.md $(TAR_DIR_ANDROID)/README.md
-	$(CMD_CP) README_CN.md $(TAR_DIR_ANDROID)/README_CN.md
-	$(CMD_MV) $(OUTPUT_DIR)/ecapture $(TAR_DIR_ANDROID)/ecapture
-	$(CMD_CP) $(RELEASE_NOTES) $(TAR_DIR_ANDROID)/release_notes.txt
-	$(CMD_TAR)  -czf $(OUT_ARCHIVE_ANDROID) $(TAR_DIR_ANDROID)
-	cd $(OUTPUT_DIR)
-	$(CMD_CHECKSUM) $(TAR_DIR_ANDROID).tar.gz >> ./../$(OUT_CHECKSUMS)
-	cd ../
+	$(call allow-override,ANDROID,1)
+	$(call release_tar,android,)
 
 .PHONY: publish
 publish: \
 	$(OUTPUT_DIR) \
 	$(OUT_ARCHIVE) \
-	$(OUT_ARCHIVE_ANDROID) \
-	$(OUT_CHECKSUMS) \
+	$(OUT_DEB_FILE) \
 	| .check_tree \
 	.check_$(CMD_GITHUB)
-#
-	# release it!
-	$(CMD_GITHUB) release create $(SNAPSHOT_VERSION) $(OUT_ARCHIVE) $(OUT_ARCHIVE_ANDROID) $(OUT_CHECKSUMS) --title "eCapture $(SNAPSHOT_VERSION)"  --notes-file $(RELEASE_NOTES)
+	@$(CMD_CD) $(OUTPUT_DIR)
+	@$(CMD_CHECKSUM) ecapture*v* | $(CMD_SED) 's/.\/bin\///g' > $(OUT_CHECKSUMS)
+	@FILES=$$(ls ecapture-*.tar.gz ecapture*.deb checksum-*.txt)
+	@$(CMD_GITHUB) release create $(DEB_VERSION) $$FILES --title "eCapture $(DEB_VERSION)"  --notes-file $(RELEASE_NOTES)
 
 .PHONY: clean
 clean:
 #
-	$(MAKE) clean
+	$(CMD_MAKE) clean
+
+.PHONY: deb
+deb: snapshot build_deb
+
+# 用于构建DEB包的目标, non-CO-RE default.
+build_deb:
+	# 创建软件包目录结构
+	$(CMD_RM) -rf $(BUILD_DIR)
+	$(CMD_MKDIR) -p $(BUILD_DIR)/DEBIAN
+	$(CMD_MKDIR) -p $(BUILD_DIR)/usr/local/bin
+    # 复制程序文件到软件包目录
+	$(CMD_CP) bin/ecapture $(BUILD_DIR)/usr/local/bin/ecapture  # 将二进制文件复制到目标位置
+    # 创建控制文件 (DEBIAN/control)
+	$(CMD_ECHO) "Package: $(PACKAGE_NAME)" > $(BUILD_DIR)/DEBIAN/control
+	$(CMD_ECHO) "Version: $(PACKAGE_VERSION)" >> $(BUILD_DIR)/DEBIAN/control
+	$(CMD_ECHO) "BuildDate: $(BUILD_DATE)" >> $(BUILD_DIR)/DEBIAN/control
+	$(CMD_ECHO) "Architecture: $(GOARCH)" >> $(BUILD_DIR)/DEBIAN/control
+	$(CMD_ECHO) "Maintainer: $(PACKAGE_MAINTAINER)" >> $(BUILD_DIR)/DEBIAN/control
+	$(CMD_ECHO) "Description: $(PACKAGE_DESC)" >> $(BUILD_DIR)/DEBIAN/control
+	$(CMD_ECHO) "Homepage: $(PACKAGE_HOMEPAGE)" >> $(BUILD_DIR)/DEBIAN/control
+    # 构建DEB包
+	$(CMD_DPKG-DEB) --build $(BUILD_DIR) $(OUT_DEB_FILE)

@@ -18,59 +18,46 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"errors"
 )
 
-func (this *GnutlsConfig) Check() error {
+func (gc *GnutlsConfig) Check() error {
 
+	var e error
 	// 如果readline 配置，且存在，则直接返回。
-	if this.Gnutls != "" || len(strings.TrimSpace(this.Gnutls)) > 0 {
-		_, e := os.Stat(this.Gnutls)
+	if gc.Gnutls != "" || len(strings.TrimSpace(gc.Gnutls)) > 0 {
+		_, e = os.Stat(gc.Gnutls)
 		if e != nil {
 			return e
 		}
-		this.ElfType = ElfTypeSo
+		gc.ElfType = ElfTypeSo
 		return nil
 	}
 
-	if this.NoSearch {
-		return errors.New("NoSearch requires specifying lib path")
+	var soLoadPaths = GetDynLibDirs()
+	var sslPath string
+	for _, soPath := range soLoadPaths {
+		_, e = os.Stat(soPath)
+		if e != nil {
+			continue
+		}
+		//	libgnutls.so.30   default
+		sslPath = filepath.Join(soPath, "libgnutls.so.30")
+		_, e = os.Stat(sslPath)
+		if e != nil {
+			continue
+		}
+		gc.Gnutls = sslPath
+		break
+	}
+	if gc.Gnutls == "" {
+		return errors.New("cant found Gnutls so load path")
 	}
 
-	//如果配置 Curlpath的地址，判断文件是否存在，不存在则直接返回
-	if this.Curlpath != "" || len(strings.TrimSpace(this.Curlpath)) > 0 {
-		_, e := os.Stat(this.Curlpath)
-		if e != nil {
-			return e
-		}
-	} else {
-		//如果没配置，则直接指定。
-		this.Curlpath = "/usr/bin/wget"
-	}
-
-	soPath, e := getDynPathByElf(this.Curlpath, "libgnutls.so")
-	if e != nil {
-		//this.logger.Printf("get bash:%s dynamic library error:%v.\n", bash, e)
-		_, e = os.Stat(X86BinaryPrefix)
-		prefix := X86BinaryPrefix
-		if e != nil {
-			prefix = OthersBinaryPrefix
-		}
-		this.Gnutls = filepath.Join(prefix, "libgnutls.so.30")
-		this.ElfType = ElfTypeSo
-		_, e = os.Stat(this.Gnutls)
-		if e != nil {
-			return e
-		}
-		return nil
-	}
-
-	this.Gnutls = soPath
-	this.ElfType = ElfTypeSo
-
+	gc.ElfType = ElfTypeSo
+	gc.Model = gc.checkModel()
 	return nil
 }

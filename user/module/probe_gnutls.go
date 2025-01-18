@@ -17,72 +17,161 @@ package module
 import (
 	"bytes"
 	"context"
-	"ecapture/assets"
-	"ecapture/user/config"
-	"ecapture/user/event"
-	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
 	"github.com/cilium/ebpf"
 	manager "github.com/gojue/ebpfmanager"
+	"github.com/gojue/ecapture/assets"
+	"github.com/gojue/ecapture/user/config"
+	"github.com/gojue/ecapture/user/event"
+	"github.com/rs/zerolog"
 	"golang.org/x/sys/unix"
-	"log"
-	"math"
-	"os"
 )
 
 type MGnutlsProbe struct {
-	Module
+	MTCProbe
 	bpfManager        *manager.Manager
 	bpfManagerOptions manager.Options
 	eventFuncMaps     map[*ebpf.Map]event.IEventStruct
 	eventMaps         []*ebpf.Map
+
+	pidConns  map[uint32]map[uint32]string
+	pidLocker sync.Locker
+
+	keyloggerFilename string
+	keylogger         *os.File
+	masterKeys        map[string]bool
+	eBPFProgramType   TlsCaptureModelType
+	sslVersion        string
+	sslBpfFile        string
 }
 
 // 对象初始化
-func (this *MGnutlsProbe) Init(ctx context.Context, logger *log.Logger, conf config.IConfig) error {
-	this.Module.Init(ctx, logger, conf)
-	this.conf = conf
-	this.Module.SetChild(this)
-	this.eventMaps = make([]*ebpf.Map, 0, 2)
-	this.eventFuncMaps = make(map[*ebpf.Map]event.IEventStruct)
+func (g *MGnutlsProbe) Init(ctx context.Context, logger *zerolog.Logger, conf config.IConfig, ecw io.Writer) error {
+	err := g.Module.Init(ctx, logger, conf, ecw)
+	if err != nil {
+		return err
+	}
+	g.conf = conf
+	g.Module.SetChild(g)
+	g.eventMaps = make([]*ebpf.Map, 0, 2)
+	g.eventFuncMaps = make(map[*ebpf.Map]event.IEventStruct)
+	g.pidConns = make(map[uint32]map[uint32]string)
+	g.pidLocker = new(sync.Mutex)
+	g.masterKeys = make(map[string]bool)
+	model := g.conf.(*config.GnutlsConfig).Model
+	switch model {
+	case config.TlsCaptureModelKey, config.TlsCaptureModelKeylog:
+		g.eBPFProgramType = TlsCaptureModelTypeKeylog
+		g.keyloggerFilename = g.conf.(*config.GnutlsConfig).KeylogFile
+		file, err := os.OpenFile(g.keyloggerFilename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+		if err != nil {
+			return err
+		}
+		g.keylogger = file
+	case config.TlsCaptureModelPcap, config.TlsCaptureModelPcapng:
+		g.eBPFProgramType = TlsCaptureModelTypePcap
+		pcapFile := g.conf.(*config.GnutlsConfig).PcapFile
+		fileInfo, err := filepath.Abs(pcapFile)
+		if err != nil {
+			g.logger.Warn().Err(err).Str("pcapFile", pcapFile).Str("eBPFProgramType", g.eBPFProgramType.String()).Msg("pcapFile not found")
+			return err
+		}
+		g.tcPacketsChan = make(chan *TcPacket, 2048)
+		g.tcPackets = make([]*TcPacket, 0, 256)
+		g.pcapngFilename = fileInfo
+	case config.TlsCaptureModelText:
+		fallthrough
+	default:
+		g.eBPFProgramType = TlsCaptureModelTypeText
+	}
+
+	var ts unix.Timespec
+	err = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	if err != nil {
+		return err
+	}
+	startTime := ts.Nano()
+	bootTime := time.Now().UnixNano() - startTime
+
+	g.startTime = uint64(startTime)
+	g.bootTime = uint64(bootTime)
+
+	g.tcPacketLocker = &sync.Mutex{}
+	g.masterKeyBuffer = bytes.NewBuffer([]byte{})
+
+	g.logger.Info().Str("model", g.eBPFProgramType.String()).Str("eBPFProgramType", g.eBPFProgramType.String()).Msg("GnuTlsProbe init")
 	return nil
 }
 
-func (this *MGnutlsProbe) Start() error {
-	if err := this.start(); err != nil {
+func (g *MGnutlsProbe) Start() error {
+	if err := g.start(); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (this *MGnutlsProbe) start() error {
-
-	// fetch ebpf assets
-	var bpfFileName = this.geteBPFName("user/bytecode/gnutls_kern.o")
-	this.logger.Printf("%s\tBPF bytecode filename:%s\n", this.Name(), bpfFileName)
-	byteBuf, err := assets.Asset(bpfFileName)
+func (g *MGnutlsProbe) start() error {
+	// get gnutls sslVersion and sslBpfFile
+	err := g.detectGnutls()
 	if err != nil {
+		g.logger.Error().Err(err).Msg("detectGnutls failed")
+		return fmt.Errorf("detectGnutls failed: %v", err)
+	}
+	// fetch ebpf assets
+	byteBuf, err := assets.Asset(g.sslBpfFile)
+	if err != nil {
+		g.logger.Error().Err(err).Strs("bytecode files", assets.AssetNames()).Msg("couldn't find bpf bytecode file")
 		return fmt.Errorf("couldn't find asset %v", err)
 	}
 
 	// setup the managers
-	err = this.setupManagers()
+	switch g.eBPFProgramType {
+	case TlsCaptureModelTypeKeylog:
+		err = g.setupManagersKeylog()
+	case TlsCaptureModelTypePcap:
+		err = g.setupManagersPcap()
+		pcapFilter := g.conf.(*config.GnutlsConfig).PcapFilter
+		if g.eBPFProgramType == TlsCaptureModelTypePcap && pcapFilter != "" {
+			ebpfFuncs := []string{tcFuncNameIngress, tcFuncNameEgress}
+			g.bpfManager.InstructionPatchers = prepareInsnPatchers(g.bpfManager,
+				ebpfFuncs, pcapFilter)
+		}
+	case TlsCaptureModelTypeText:
+		fallthrough
+	default:
+		err = g.setupManagersText()
+	}
 	if err != nil {
 		return fmt.Errorf("tls(gnutls) module couldn't find binPath %v", err)
 	}
 
 	// initialize the bootstrap manager
-	if err = this.bpfManager.InitWithOptions(bytes.NewReader(byteBuf), this.bpfManagerOptions); err != nil {
+	if err = g.bpfManager.InitWithOptions(bytes.NewReader(byteBuf), g.bpfManagerOptions); err != nil {
 		return fmt.Errorf("couldn't init manager %v", err)
 	}
 
 	// start the bootstrap manager
-	if err = this.bpfManager.Start(); err != nil {
+	if err = g.bpfManager.Start(); err != nil {
 		return fmt.Errorf("couldn't start bootstrap manager %v", err)
 	}
 
 	// 加载map信息，map对应events decode表。
-	err = this.initDecodeFun()
+	switch g.eBPFProgramType {
+	case TlsCaptureModelTypeKeylog:
+		err = g.initDecodeFunKeylog()
+	case TlsCaptureModelTypePcap:
+		err = g.initDecodeFunPcap()
+	case TlsCaptureModelTypeText:
+		fallthrough
+	default:
+		err = g.initDecodeFunText()
+	}
 	if err != nil {
 		return err
 	}
@@ -90,134 +179,60 @@ func (this *MGnutlsProbe) start() error {
 	return nil
 }
 
-func (this *MGnutlsProbe) Close() error {
-	if err := this.bpfManager.Stop(manager.CleanAll); err != nil {
+func (g *MGnutlsProbe) Close() error {
+	if err := g.bpfManager.Stop(manager.CleanAll); err != nil {
 		return fmt.Errorf("couldn't stop manager %v", err)
 	}
-	return this.Module.Close()
+	return g.Module.Close()
 }
 
 // 通过elf的常量替换方式传递数据
-func (this *MGnutlsProbe) constantEditor() []manager.ConstantEditor {
+func (g *MGnutlsProbe) constantEditor() []manager.ConstantEditor {
 	var editor = []manager.ConstantEditor{
 		{
 			Name:  "target_pid",
-			Value: uint64(this.conf.GetPid()),
+			Value: uint64(g.conf.GetPid()),
 			//FailOnMissing: true,
 		},
 	}
 
-	if this.conf.GetPid() <= 0 {
-		this.logger.Printf("%s\ttarget all process. \n", this.Name())
+	if g.conf.GetPid() <= 0 {
+		g.logger.Info().Msg("target all process.")
 	} else {
-		this.logger.Printf("%s\ttarget PID:%d \n", this.Name(), this.conf.GetPid())
+		g.logger.Info().Uint64("target pid", g.conf.GetPid()).Msg("target process.")
 	}
 	return editor
 }
 
-func (this *MGnutlsProbe) setupManagers() error {
-	var binaryPath string
-	switch this.conf.(*config.GnutlsConfig).ElfType {
-	case config.ElfTypeBin:
-		binaryPath = this.conf.(*config.GnutlsConfig).Curlpath
-	case config.ElfTypeSo:
-		binaryPath = this.conf.(*config.GnutlsConfig).Gnutls
-	default:
-		//如果没找到
-		binaryPath = "/lib/x86_64-linux-gnu/libgnutls.so.30"
-	}
-
-	_, err := os.Stat(binaryPath)
-	if err != nil {
-		return err
-	}
-
-	this.logger.Printf("%s\tHOOK type:%d, binrayPath:%s\n", this.Name(), this.conf.(*config.GnutlsConfig).ElfType, binaryPath)
-
-	this.bpfManager = &manager.Manager{
-		Probes: []*manager.Probe{
-			{
-				Section:          "uprobe/gnutls_record_send",
-				EbpfFuncName:     "probe_entry_SSL_write",
-				AttachToFuncName: "gnutls_record_send",
-				BinaryPath:       binaryPath,
-			},
-			{
-				Section:          "uretprobe/gnutls_record_send",
-				EbpfFuncName:     "probe_ret_SSL_write",
-				AttachToFuncName: "gnutls_record_send",
-				BinaryPath:       binaryPath,
-			},
-			{
-				Section:          "uprobe/gnutls_record_recv",
-				EbpfFuncName:     "probe_entry_SSL_read",
-				AttachToFuncName: "gnutls_record_recv",
-				BinaryPath:       binaryPath,
-			},
-			{
-				Section:          "uretprobe/gnutls_record_recv",
-				EbpfFuncName:     "probe_ret_SSL_read",
-				AttachToFuncName: "gnutls_record_recv",
-				BinaryPath:       binaryPath,
-			},
-		},
-
-		Maps: []*manager.Map{
-			{
-				Name: "gnutls_events",
-			},
-		},
-	}
-
-	this.bpfManagerOptions = manager.Options{
-		DefaultKProbeMaxActive: 512,
-
-		VerifierOptions: ebpf.CollectionOptions{
-			Programs: ebpf.ProgramOptions{
-				LogSize: 2097152,
-			},
-		},
-
-		RLimit: &unix.Rlimit{
-			Cur: math.MaxUint64,
-			Max: math.MaxUint64,
-		},
-	}
-
-	if this.conf.EnableGlobalVar() {
-		// 填充 RewriteContants 对应map
-		this.bpfManagerOptions.ConstantEditors = this.constantEditor()
-	}
-	return nil
-}
-
-func (this *MGnutlsProbe) DecodeFun(em *ebpf.Map) (event.IEventStruct, bool) {
-	fun, found := this.eventFuncMaps[em]
+func (g *MGnutlsProbe) DecodeFun(em *ebpf.Map) (event.IEventStruct, bool) {
+	fun, found := g.eventFuncMaps[em]
 	return fun, found
 }
 
-func (this *MGnutlsProbe) initDecodeFun() error {
-	//GnutlsEventsMap 与解码函数映射
-	GnutlsEventsMap, found, err := this.bpfManager.GetMap("gnutls_events")
-	if err != nil {
-		return err
-	}
-	if !found {
-		return errors.New("cant found map:gnutls_events")
-	}
-	this.eventMaps = append(this.eventMaps, GnutlsEventsMap)
-	this.eventFuncMaps[GnutlsEventsMap] = &event.GnutlsDataEvent{}
-
-	return nil
+func (g *MGnutlsProbe) Events() []*ebpf.Map {
+	return g.eventMaps
 }
 
-func (this *MGnutlsProbe) Events() []*ebpf.Map {
-	return this.eventMaps
+func (g *MGnutlsProbe) Dispatcher(eventStruct event.IEventStruct) {
+	// detect eventStruct type
+	switch eventStruct.(type) {
+	case *event.MasterSecretGnutlsEvent:
+		g.saveMasterSecret(eventStruct.(*event.MasterSecretGnutlsEvent))
+	case *event.TcSkbEvent:
+		err := g.dumpTcSkb(eventStruct.(*event.TcSkbEvent))
+		if err != nil {
+			g.logger.Warn().Err(err).Msg("save packet error.")
+		}
+	}
 }
 
 func init() {
+	RegisteFunc(NewGnutlsProbe)
+}
+
+func NewGnutlsProbe() IModule {
 	mod := &MGnutlsProbe{}
 	mod.name = ModuleNameGnutls
 	mod.mType = ProbeTypeUprobe
-	Register(mod)
+	return mod
 }

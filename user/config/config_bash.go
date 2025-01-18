@@ -15,44 +15,85 @@
 package config
 
 import (
+	"debug/elf"
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
 )
 
-// Bashpath 与 readline 两个参数，使用时二选一
+// BashConfig Bashpath 与 readline 两个参数，使用时二选一
 type BashConfig struct {
-	eConfig
-	Bashpath string `json:"bashpath"` //bash的文件路径
-	Readline string `json:"readline"`
-	ErrNo    int
-	ElfType  uint8 //
+	BaseConfig
+	Bashpath         string `json:"bashpath"` //bash的文件路径
+	Readline         string `json:"readline"`
+	ErrNo            int
+	ElfType          uint8 //
+	ReadlineFuncName string
 }
 
 func NewBashConfig() *BashConfig {
 	config := &BashConfig{}
+	config.PerCpuMapSize = DefaultMapSizePerCpu
 	return config
 }
 
-func (this *BashConfig) Check() error {
+func (bc *BashConfig) Check() error {
+	var binaryPath string
+	switch bc.ElfType {
+	case ElfTypeBin:
+		binaryPath = bc.Bashpath
+	case ElfTypeSo:
+		binaryPath = bc.Readline
+	default:
+		binaryPath = "/bin/bash"
+	}
 
+	file, err := elf.Open(binaryPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	symbols, err := file.DynamicSymbols()
+	if err != nil {
+		return err
+	}
+
+	targetSymbol := "readline_internal_teardown"
+	found := false
+	for _, sym := range symbols {
+		if sym.Name == targetSymbol {
+			found = true
+			break
+		}
+	}
+	if found {
+		bc.ReadlineFuncName = "readline_internal_teardown"
+	} else {
+		bc.ReadlineFuncName = "readline"
+	}
+	return nil
+}
+
+func (bc *BashConfig) checkElf() error {
 	// 如果readline 配置，且存在，则直接返回。
-	if this.Readline != "" || len(strings.TrimSpace(this.Readline)) > 0 {
-		_, e := os.Stat(this.Readline)
+	if bc.Readline != "" || len(strings.TrimSpace(bc.Readline)) > 0 {
+		_, e := os.Stat(bc.Readline)
 		if e != nil {
 			return e
 		}
-		this.ElfType = ElfTypeSo
+		bc.ElfType = ElfTypeSo
 		return nil
 	}
 
 	//如果配置 bash的地址，且存在，则直接返回
-	if this.Bashpath != "" || len(strings.TrimSpace(this.Bashpath)) > 0 {
-		_, e := os.Stat(this.Bashpath)
+	if bc.Bashpath != "" || len(strings.TrimSpace(bc.Bashpath)) > 0 {
+		_, e := os.Stat(bc.Bashpath)
 		if e != nil {
 			return e
 		}
-		this.ElfType = ElfTypeBin
+		bc.ElfType = ElfTypeBin
 		return nil
 	}
 
@@ -61,17 +102,23 @@ func (this *BashConfig) Check() error {
 	if b {
 		soPath, e := getDynPathByElf(bash, "libreadline.so")
 		if e != nil {
-			//this.logger.Printf("get bash:%s dynamic library error:%v.\n", bash, e)
-			this.Bashpath = bash
-			this.ElfType = ElfTypeBin
+			bc.Bashpath = bash
+			bc.ElfType = ElfTypeBin
 		} else {
-			this.Bashpath = soPath
-			this.ElfType = ElfTypeSo
+			bc.Bashpath = soPath
+			bc.ElfType = ElfTypeSo
 		}
 
 	} else {
 		return errors.New("cant found $SHELL path.")
 	}
-
 	return nil
+}
+
+func (bc *BashConfig) Bytes() []byte {
+	b, e := json.Marshal(bc)
+	if e != nil {
+		return []byte{}
+	}
+	return b
 }

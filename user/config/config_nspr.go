@@ -14,15 +14,26 @@
 
 package config
 
+import "encoding/json"
+
 // 最终使用openssl参数
 type NsprConfig struct {
-	eConfig
-	Firefoxpath string `json:"firefoxpath"` //curl的文件路径
-	Nsprpath    string `json:"nsprpath"`
-	ElfType     uint8  //
+	BaseConfig
+	//Firefoxpath string `json:"firefoxpath"` //curl的文件路径
+	Nsprpath string `json:"nsprpath"`
+	ElfType  uint8  //
 }
 
 func NewNsprConfig() *NsprConfig {
 	config := &NsprConfig{}
+	config.PerCpuMapSize = DefaultMapSizePerCpu
 	return config
+}
+
+func (nc *NsprConfig) Bytes() []byte {
+	b, e := json.Marshal(nc)
+	if e != nil {
+		return []byte{}
+	}
+	return b
 }

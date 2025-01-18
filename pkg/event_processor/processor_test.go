@@ -3,8 +3,9 @@ package event_processor
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ type SSLDataEventTmp struct {
 	Timestamp uint64     `json:"Timestamp"`
 	Pid       uint32     `json:"Pid"`
 	Tid       uint32     `json:"Tid"`
-	Data_len  int32      `json:"DataLen"`
+	DataLen   int32      `json:"DataLen"`
 	Comm      [16]byte   `json:"Comm"`
 	Fd        uint32     `json:"Fd"`
 	Version   int32      `json:"Version"`
@@ -30,22 +31,28 @@ type SSLDataEventTmp struct {
 func TestEventProcessor_Serve(t *testing.T) {
 
 	logger := log.Default()
-	/*
-		f, e := os.Create("./output.log")
-		if e != nil {
-			t.Fatal(e)
-		}
-		logger.SetOutput(f)
-	*/
-	ep := NewEventProcessor(logger, true)
-
+	//var buf bytes.Buffer
+	//logger.SetOutput(&buf)
+	var output = "./output.log"
+	f, e := os.Create(output)
+	if e != nil {
+		t.Fatal(e)
+	}
+	logger.SetOutput(f)
+	ep := NewEventProcessor(f, true)
 	go func() {
-		ep.Serve()
+		var err error
+		err = ep.Serve()
+		if err != nil {
+			//log.Fatalf(err.Error())
+			t.Error(err)
+			return
+		}
 	}()
-	content, err := ioutil.ReadFile(testFile)
+	content, err := os.ReadFile(testFile)
 	if err != nil {
 		//Do something
-		log.Fatalf("open file error: %s, file:%s", err.Error(), testFile)
+		t.Fatalf("open file error: %s, file:%s", err.Error(), testFile)
 	}
 	lines := strings.Split(string(content), "\n")
 
@@ -59,21 +66,45 @@ func TestEventProcessor_Serve(t *testing.T) {
 			t.Fatalf("json unmarshal error: %s, body:%v", err.Error(), line)
 		}
 		payloadFile := fmt.Sprintf("testdata/%d.bin", eventSSL.Timestamp)
-		b, e := ioutil.ReadFile(payloadFile)
+		b, e := os.ReadFile(payloadFile)
 		if e != nil {
 			t.Fatalf("read payload file error: %s, file:%s", e.Error(), payloadFile)
 		}
 		copy(eventSSL.Data[:], b)
-		ep.Write(&BaseEvent{Data_len: eventSSL.Data_len, Data: eventSSL.Data, DataType: eventSSL.DataType, Timestamp: eventSSL.Timestamp, Pid: eventSSL.Pid, Tid: eventSSL.Tid, Comm: eventSSL.Comm, Fd: eventSSL.Fd, Version: eventSSL.Version})
+		ep.Write(&BaseEvent{DataLen: eventSSL.DataLen, Data: eventSSL.Data, DataType: eventSSL.DataType, Timestamp: eventSSL.Timestamp, Pid: eventSSL.Pid, Tid: eventSSL.Tid, Comm: eventSSL.Comm, Fd: eventSSL.Fd, Version: eventSSL.Version})
 	}
 
-	tick := time.NewTicker(time.Second * 3)
-	select {
-	case <-tick.C:
-	}
+	tick := time.NewTicker(time.Second * 10)
+	<-tick.C
+
 	err = ep.Close()
+	logger.SetOutput(io.Discard)
+	bufString, e := os.ReadFile(output)
+	if e != nil {
+		t.Fatal(e)
+	}
+
+	lines = strings.Split(string(bufString), "\n")
+	ok := true
+	for _, line := range lines {
+		if strings.Contains(strings.ToLower(line), "dump") {
+			t.Log(line)
+			ok = false
+		}
+		// http2 parse error log
+		if strings.Contains(line, "[http2 re") {
+			t.Log(line)
+			ok = false
+		}
+
+	}
 	if err != nil {
 		t.Fatalf("close error: %s", err.Error())
 	}
+
+	if !ok {
+		t.Fatalf("some errors occurred")
+	}
+	//t.Log(string(bufString))
 	t.Log("done")
 }

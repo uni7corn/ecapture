@@ -36,7 +36,7 @@ func TestBpfConfig(t *testing.T) {
 	configPaths = []string{
 		"/xxxxx/proc/config.gz", // android
 	}
-	m, e := GetSystemConfig()
+	_, e := GetSystemConfig()
 	if e != nil {
 		// 正常情况 是没有找到配置文件
 		t.Logf("GetSystemConfig error:%s", e.Error())
@@ -47,7 +47,7 @@ func TestBpfConfig(t *testing.T) {
 	configPaths = []string{
 		"config.gz", // test file from pixel 6 android 12
 	}
-	m, e = GetSystemConfig()
+	m, e := GetSystemConfig()
 	if e != nil {
 		t.Fatalf("GetSystemConfig(gzip) error:%s", e.Error())
 	}
@@ -98,7 +98,7 @@ func TestBpfConfig(t *testing.T) {
 }
 
 func TestIsContainerCgroup(t *testing.T) {
-	isContainer, err := isCOntainerCgroup()
+	isContainer, err := isContainerCgroup()
 	if err != nil {
 		t.Fatalf("TestIsContainerCgroup :: IsContainer error:%s", err.Error())
 	}
@@ -110,7 +110,7 @@ func TestIsContainerCgroup(t *testing.T) {
 }
 
 func TestIsContainerSched(t *testing.T) {
-	isContainer, err := isCOntainerSched()
+	isContainer, err := isContainerSched()
 	if err != nil {
 		t.Fatalf("TestIsContainerSched :: IsContainer error:%s", err.Error())
 	}

@@ -17,7 +17,9 @@
 
 package config
 
-import "log"
+import (
+	"os"
+)
 
 const (
 	LdLoadPath       = "/etc/ld.so.conf"
@@ -40,12 +42,14 @@ var (
 		"/usr/lib64",
 		"/lib64",
 	}
+
+	// DefaultMapSizePerCpu default: 4MB
+	DefaultMapSizePerCpu = os.Getpagesize() * 1024
 )
 
 func GetDynLibDirs() []string {
 	dirs, err := ParseDynLibConf(LdLoadPath)
 	if err != nil {
-		log.Println(err.Error())
 		return default_so_paths
 	}
 	return append(dirs, "/lib64", "/usr/lib64")
