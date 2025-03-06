@@ -18,7 +18,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"net"
+	"golang.org/x/sys/unix"
+	"net/netip"
+	"strings"
+	"unsafe"
 )
 
 type AttachType int64
@@ -28,8 +31,7 @@ const (
 	ProbeRet
 )
 
-const MaxDataSize = 1024 * 4
-const SaDataLen = 14
+const MaxDataSize = 1024 * 16	// fix: https://github.com/gojue/ecapture/issues/740
 
 const (
 	Ssl2Version   = 0x0002
@@ -69,189 +71,213 @@ func (t TlsVersion) String() string {
 }
 
 type SSLDataEvent struct {
-	event_type EventType
-	DataType   int64             `json:"dataType"`
-	Timestamp  uint64            `json:"timestamp"`
-	Pid        uint32            `json:"pid"`
-	Tid        uint32            `json:"tid"`
-	Data       [MaxDataSize]byte `json:"data"`
-	DataLen    int32             `json:"dataLen"`
-	Comm       [16]byte          `json:"Comm"`
-	Fd         uint32            `json:"fd"`
-	Version    int32             `json:"version"`
+	eventType EventType
+	DataType  int64             `json:"dataType"`
+	Timestamp uint64            `json:"timestamp"`
+	Pid       uint32            `json:"pid"`
+	Tid       uint32            `json:"tid"`
+	Data      [MaxDataSize]byte `json:"data"`
+	DataLen   int32             `json:"dataLen"`
+	Comm      [16]byte          `json:"Comm"`
+	Fd        uint32            `json:"fd"`
+	Version   int32             `json:"version"`
+	Tuple     string
+	BioType   uint32
 }
 
-func (this *SSLDataEvent) Decode(payload []byte) (err error) {
+func (se *SSLDataEvent) Decode(payload []byte) (err error) {
 	buf := bytes.NewBuffer(payload)
-	if err = binary.Read(buf, binary.LittleEndian, &this.DataType); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &se.DataType); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Timestamp); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &se.Timestamp); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Pid); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &se.Pid); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Tid); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &se.Tid); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Data); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &se.Data); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.DataLen); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &se.DataLen); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Comm); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &se.Comm); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Fd); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &se.Fd); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Version); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &se.Version); err != nil {
+		return
+	}
+	if err = binary.Read(buf, binary.LittleEndian, &se.BioType); err != nil {
 		return
 	}
 
+	decodedKtime, err := DecodeKtime(int64(se.Timestamp), true)
+	if err == nil {
+		se.Timestamp = uint64(decodedKtime.Unix())
+	}
 	return nil
 }
 
-func (this *SSLDataEvent) GetUUID() string {
-	return fmt.Sprintf("%d_%d_%s_%d_%d", this.Pid, this.Tid, CToGoString(this.Comm[:]), this.Fd, this.DataType)
+func commStr(comm []byte) string {
+	return strings.TrimSpace(CToGoString(comm))
 }
 
-func (this *SSLDataEvent) Payload() []byte {
-	return this.Data[:this.DataLen]
+func (se *SSLDataEvent) GetUUID() string {
+	return fmt.Sprintf("%d_%d_%s_%d_%d_%s", se.Pid, se.Tid, commStr(se.Comm[:]), se.Fd, se.DataType, se.Tuple)
 }
 
-func (this *SSLDataEvent) PayloadLen() int {
-	return int(this.DataLen)
+func (se *SSLDataEvent) Payload() []byte {
+	return se.Data[:se.DataLen]
 }
 
-func (this *SSLDataEvent) StringHex() string {
-	//addr := this.module.(*module.MOpenSSLProbe).GetConn(this.Pid, this.Fd)
+func (se *SSLDataEvent) PayloadLen() int {
+	return int(se.DataLen)
+}
+
+func (se *SSLDataEvent) StringHex() string {
+	//addr := se.module.(*module.MOpenSSLProbe).GetConn(se.Pid, se.Fd)
 	addr := "[TODO]"
-	var perfix, connInfo string
-	switch AttachType(this.DataType) {
+	var prefix, connInfo string
+	switch AttachType(se.DataType) {
 	case ProbeEntry:
-		connInfo = fmt.Sprintf("%sRecived %d%s bytes from %s%s%s", COLORGREEN, this.DataLen, COLORRESET, COLORYELLOW, addr, COLORRESET)
-		perfix = COLORGREEN
+		connInfo = fmt.Sprintf("%sRecived %d%s bytes from %s%s%s", COLORGREEN, se.DataLen, COLORRESET, COLORYELLOW, addr, COLORRESET)
+		prefix = COLORGREEN
 	case ProbeRet:
-		connInfo = fmt.Sprintf("%sSend %d%s bytes to %s%s%s", COLORPURPLE, this.DataLen, COLORRESET, COLORYELLOW, addr, COLORRESET)
-		perfix = fmt.Sprintf("%s\t", COLORPURPLE)
+		connInfo = fmt.Sprintf("%sSend %d%s bytes to %s%s%s", COLORPURPLE, se.DataLen, COLORRESET, COLORYELLOW, addr, COLORRESET)
+		prefix = fmt.Sprintf("%s\t", COLORPURPLE)
 	default:
-		perfix = fmt.Sprintf("UNKNOW_%d", this.DataType)
+		prefix = fmt.Sprintf("UNKNOW_%d", se.DataType)
 	}
 
-	b := dumpByteSlice(this.Data[:this.DataLen], perfix)
+	b := dumpByteSlice(se.Data[:se.DataLen], prefix)
 	b.WriteString(COLORRESET)
 
-	v := TlsVersion{Version: this.Version}
-	s := fmt.Sprintf("PID:%d, Comm:%s, TID:%d, %s, Version:%s, Payload:\n%s", this.Pid, CToGoString(this.Comm[:]), this.Tid, connInfo, v.String(), b.String())
+	v := TlsVersion{Version: se.Version}
+	s := fmt.Sprintf("PID:%d, Comm:%s, TID:%d, %s, Version:%s, Payload:\n%s", se.Pid, commStr(se.Comm[:]), se.Tid, connInfo, v.String(), b.String())
 	return s
 }
 
-func (this *SSLDataEvent) String() string {
-	//addr := this.module.(*module.MOpenSSLProbe).GetConn(this.Pid, this.Fd)
+func (se *SSLDataEvent) String() string {
+	//addr := se.module.(*module.MOpenSSLProbe).GetConn(se.Pid, se.Fd)
 	addr := "[TODO]"
-	var perfix, connInfo string
-	switch AttachType(this.DataType) {
-	case ProbeEntry:
-		connInfo = fmt.Sprintf("%sRecived %d%s bytes from %s%s%s", COLORGREEN, this.DataLen, COLORRESET, COLORYELLOW, addr, COLORRESET)
-		perfix = COLORGREEN
-	case ProbeRet:
-		connInfo = fmt.Sprintf("%sSend %d%s bytes to %s%s%s", COLORPURPLE, this.DataLen, COLORRESET, COLORYELLOW, addr, COLORRESET)
-		perfix = COLORPURPLE
-	default:
-		connInfo = fmt.Sprintf("%sUNKNOW_%d%s", COLORRED, this.DataType, COLORRESET)
+	if se.Tuple != "" {
+		addr = se.Tuple
 	}
-	v := TlsVersion{Version: this.Version}
-	s := fmt.Sprintf("PID:%d, Comm:%s, TID:%d, Version:%s, %s, Payload:\n%s%s%s", this.Pid, bytes.TrimSpace(this.Comm[:]), this.Tid, v.String(), connInfo, perfix, string(this.Data[:this.DataLen]), COLORRESET)
+	var prefix, connInfo string
+	switch AttachType(se.DataType) {
+	case ProbeEntry:
+		connInfo = fmt.Sprintf("%sRecived %d%s bytes from %s%s%s", COLORGREEN, se.DataLen, COLORRESET, COLORYELLOW, addr, COLORRESET)
+		prefix = COLORGREEN
+	case ProbeRet:
+		connInfo = fmt.Sprintf("%sSend %d%s bytes to %s%s%s", COLORPURPLE, se.DataLen, COLORRESET, COLORYELLOW, addr, COLORRESET)
+		prefix = COLORPURPLE
+	default:
+		connInfo = fmt.Sprintf("%sUNKNOW_%d%s", COLORRED, se.DataType, COLORRESET)
+	}
+	v := TlsVersion{Version: se.Version}
+	s := fmt.Sprintf("PID:%d, Comm:%s, TID:%d, Version:%s, %s, Payload:\n%s%s%s", se.Pid, commStr(se.Comm[:]), se.Tid, v.String(), connInfo, prefix, string(se.Data[:se.DataLen]), COLORRESET)
 	return s
 }
 
-func (this *SSLDataEvent) Clone() IEventStruct {
+func (se *SSLDataEvent) Clone() IEventStruct {
 	event := new(SSLDataEvent)
-	event.event_type = EventTypeEventProcessor
+	event.eventType = EventTypeModuleData //EventTypeEventProcessor
 	return event
 }
 
-func (this *SSLDataEvent) EventType() EventType {
-	return this.event_type
+func (se *SSLDataEvent) EventType() EventType {
+	return se.eventType
 }
 
 //  connect_events map
 /*
-uint64_t timestamp_ns;
-  uint32_t pid;
-  uint32_t tid;
-  uint32_t fd;
-  char sa_data[SA_DATA_LEN];
-  char Comm[TASK_COMM_LEN];
+   unsigned __int128 saddr;
+   unsigned __int128 daddr;
+   char comm[TASK_COMM_LEN];
+   u64 timestamp_ns;
+   u64 sock;
+   u32 pid;
+   u32 tid;
+   u32 fd;
+   u16 family;
+   u16 sport;
+   u16 dport;
+   u8 is_destroy;
+   u8 pad[7];
 */
+type connDataEvent struct {
+	Saddr       [16]byte `json:"saddr"`
+	Daddr       [16]byte `json:"daddr"`
+	Comm        [16]byte `json:"Comm"`
+	TimestampNs uint64   `json:"timestampNs"`
+	Sock        uint64   `json:"sock"`
+	Pid         uint32   `json:"pid"`
+	Tid         uint32   `json:"tid"`
+	Fd          uint32   `json:"fd"`
+	Family      uint16   `json:"family"`
+	Sport       uint16   `json:"sport"`
+	Dport       uint16   `json:"dport"`
+	IsDestroy   uint8    `json:"isDestroy"`
+	Pad         [7]byte  `json:"-"`
+
+	// NOTE: do not leave padding hole in this struct.
+}
 type ConnDataEvent struct {
-	event_type  EventType
-	TimestampNs uint64          `json:"timestampNs"`
-	Pid         uint32          `json:"pid"`
-	Tid         uint32          `json:"tid"`
-	Fd          uint32          `json:"fd"`
-	SaData      [SaDataLen]byte `json:"saData"`
-	Comm        [16]byte        `json:"Comm"`
-	Addr        string          `json:"addr"`
+	eventType EventType
+	connDataEvent
+	Tuple string `json:"tuple"`
 }
 
-func (this *ConnDataEvent) Decode(payload []byte) (err error) {
-	buf := bytes.NewBuffer(payload)
-	if err = binary.Read(buf, binary.LittleEndian, &this.TimestampNs); err != nil {
-		return
-	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Pid); err != nil {
-		return
-	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Tid); err != nil {
-		return
-	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Fd); err != nil {
-		return
-	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.SaData); err != nil {
-		return
-	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Comm); err != nil {
-		return
-	}
-	port := binary.BigEndian.Uint16(this.SaData[0:2])
-	ip := net.IPv4(this.SaData[2], this.SaData[3], this.SaData[4], this.SaData[5])
-	this.Addr = fmt.Sprintf("%s:%d", ip, port)
-	return nil
+func (ce *ConnDataEvent) Decode(payload []byte) (err error) {
+	data := unsafe.Slice((*byte)(unsafe.Pointer(&ce.connDataEvent)), int(unsafe.Sizeof(ce.connDataEvent)))
+	copy(data, payload)
+
+        if ce.Family == unix.AF_INET {
+            saddr, daddr := netip.AddrFrom4([4]byte(ce.Saddr[:4])), netip.AddrFrom4([4]byte(ce.Daddr[:4]))
+            ce.Tuple = fmt.Sprintf("%s:%d-%s:%d", saddr, ce.Sport, daddr, ce.Dport)
+        } else {
+            saddr, daddr := netip.AddrFrom16(ce.Saddr), netip.AddrFrom16(ce.Daddr)
+            ce.Tuple = fmt.Sprintf("[%s]:%d-[%s]:%d", saddr, ce.Sport, daddr, ce.Dport)
+        }
+
+        return nil
 }
 
-func (this *ConnDataEvent) StringHex() string {
-	s := fmt.Sprintf("PID:%d, Comm:%s, TID:%d, FD:%d, Addr: %s", this.Pid, bytes.TrimSpace(this.Comm[:]), this.Tid, this.Fd, this.Addr)
+func (ce *ConnDataEvent) StringHex() string {
+	s := fmt.Sprintf("PID:%d, Comm:%s, TID:%d, FD:%d, Tuple: %s", ce.Pid, commStr(ce.Comm[:]), ce.Tid, ce.Fd, ce.Tuple)
 	return s
 }
 
-func (this *ConnDataEvent) String() string {
-	s := fmt.Sprintf("PID:%d, Comm:%s, TID:%d, FD:%d, Addr: %s", this.Pid, bytes.TrimSpace(this.Comm[:]), this.Tid, this.Fd, this.Addr)
+func (ce *ConnDataEvent) String() string {
+	s := fmt.Sprintf("PID:%d, Comm:%s, TID:%d, FD:%d, Tuple: %s", ce.Pid, commStr(ce.Comm[:]), ce.Tid, ce.Fd, ce.Tuple)
 	return s
 }
 
-func (this *ConnDataEvent) Clone() IEventStruct {
+func (ce *ConnDataEvent) Clone() IEventStruct {
 	event := new(ConnDataEvent)
-	event.event_type = EventTypeModuleData
+	event.eventType = EventTypeModuleData
 	return event
 }
 
-func (this *ConnDataEvent) EventType() EventType {
-	return this.event_type
+func (ce *ConnDataEvent) EventType() EventType {
+	return ce.eventType
 }
 
-func (this *ConnDataEvent) GetUUID() string {
-	return fmt.Sprintf("%d_%d_%s_%d", this.Pid, this.Tid, bytes.TrimSpace(this.Comm[:]), this.Fd)
+func (ce *ConnDataEvent) GetUUID() string {
+	return fmt.Sprintf("%d_%d_%s_%d", ce.Pid, ce.Tid, commStr(ce.Comm[:]), ce.Fd)
 }
 
-func (this *ConnDataEvent) Payload() []byte {
-	return []byte(this.Addr)
+func (ce *ConnDataEvent) Payload() []byte {
+	return []byte(ce.Tuple)
 }
 
-func (this *ConnDataEvent) PayloadLen() int {
-	return len(this.Addr)
+func (ce *ConnDataEvent) PayloadLen() int {
+	return len(ce.Tuple)
 }

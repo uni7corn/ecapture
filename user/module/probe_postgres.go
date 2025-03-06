@@ -20,11 +20,12 @@ package module
 import (
 	"bytes"
 	"context"
-	"ecapture/assets"
-	"ecapture/user/config"
-	"ecapture/user/event"
 	"fmt"
-	"log"
+	"github.com/gojue/ecapture/assets"
+	"github.com/gojue/ecapture/user/config"
+	"github.com/gojue/ecapture/user/event"
+	"github.com/rs/zerolog"
+	"io"
 	"math"
 	"os"
 
@@ -43,50 +44,55 @@ type MPostgresProbe struct {
 }
 
 // init probe
-func (this *MPostgresProbe) Init(ctx context.Context, logger *log.Logger, conf config.IConfig) error {
-	this.Module.Init(ctx, logger, conf)
-	this.conf = conf
-	this.Module.SetChild(this)
-	this.eventMaps = make([]*ebpf.Map, 0, 2)
-	this.eventFuncMaps = make(map[*ebpf.Map]event.IEventStruct)
+func (p *MPostgresProbe) Init(ctx context.Context, logger *zerolog.Logger, conf config.IConfig, ecw io.Writer) error {
+	err := p.Module.Init(ctx, logger, conf, ecw)
+	if err != nil {
+		return err
+	}
+	p.conf = conf
+	p.Module.SetChild(p)
+	p.eventMaps = make([]*ebpf.Map, 0, 2)
+	p.eventFuncMaps = make(map[*ebpf.Map]event.IEventStruct)
 	return nil
 }
 
-func (this *MPostgresProbe) Start() error {
-	if err := this.start(); err != nil {
+func (p *MPostgresProbe) Start() error {
+	if err := p.start(); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (this *MPostgresProbe) start() error {
+func (p *MPostgresProbe) start() error {
 
 	// fetch ebpf assets
-	var bpfFileName = this.geteBPFName("user/bytecode/postgres_kern.o")
-	this.logger.Printf("%s\tBPF bytecode filename:%s\n", this.Name(), bpfFileName)
-	byteBuf, err := assets.Asset("user/bytecode/postgres_kern.o")
+	var bpfFileName = p.geteBPFName("user/bytecode/postgres_kern.o")
+	p.logger.Info().Str("bpfFileName", bpfFileName).Msg("BPF bytecode file is matched.")
+
+	byteBuf, err := assets.Asset(bpfFileName)
 	if err != nil {
+		p.logger.Error().Err(err).Strs("bytecode files", assets.AssetNames()).Msg("couldn't find bpf bytecode file")
 		return fmt.Errorf("couldn't find asset")
 	}
 
 	// setup the managers
-	err = this.setupManagers()
+	err = p.setupManagers()
 	if err != nil {
 		return fmt.Errorf("postgres module couldn't find binPath %v.", err)
 	}
 
 	// initialize the bootstrap manager
-	if err := this.bpfManager.InitWithOptions(bytes.NewReader(byteBuf), this.bpfManagerOptions); err != nil {
+	if err := p.bpfManager.InitWithOptions(bytes.NewReader(byteBuf), p.bpfManagerOptions); err != nil {
 		return fmt.Errorf("couldn't init manager %v.", err)
 	}
 
 	// start the bootstrap manager
-	if err := this.bpfManager.Start(); err != nil {
+	if err := p.bpfManager.Start(); err != nil {
 		return fmt.Errorf("couldn't start bootstrap manager %v.", err)
 	}
 
 	// 加载map信息，map对应events decode表。
-	err = this.initDecodeFun()
+	err = p.initDecodeFun()
 	if err != nil {
 		return err
 	}
@@ -94,32 +100,32 @@ func (this *MPostgresProbe) start() error {
 	return nil
 }
 
-func (this *MPostgresProbe) Close() error {
-	if err := this.bpfManager.Stop(manager.CleanAll); err != nil {
+func (p *MPostgresProbe) Close() error {
+	if err := p.bpfManager.Stop(manager.CleanAll); err != nil {
 		return fmt.Errorf("couldn't stop manager %v.", err)
 	}
-	return this.Module.Close()
+	return p.Module.Close()
 }
 
-func (this *MPostgresProbe) setupManagers() error {
-	binaryPath := this.conf.(*config.PostgresConfig).PostgresPath
+func (p *MPostgresProbe) setupManagers() error {
+	binrayPath := p.conf.(*config.PostgresConfig).PostgresPath
 
-	_, err := os.Stat(binaryPath)
+	_, err := os.Stat(binrayPath)
 	if err != nil {
 		return err
 	}
-	attachFunc := this.conf.(*config.PostgresConfig).FuncName
+	attachFunc := p.conf.(*config.PostgresConfig).FuncName
 
 	probes := []*manager.Probe{
 		{
 			Section:          "uprobe/exec_simple_query",
 			EbpfFuncName:     "postgres_query",
 			AttachToFuncName: attachFunc,
-			BinaryPath:       binaryPath,
+			BinaryPath:       binrayPath,
 		},
 	}
 
-	this.bpfManager = &manager.Manager{
+	p.bpfManager = &manager.Manager{
 		Probes: probes,
 		Maps: []*manager.Map{
 			{
@@ -128,9 +134,9 @@ func (this *MPostgresProbe) setupManagers() error {
 		},
 	}
 
-	this.logger.Printf("Postgres, binrayPath: %s, FunctionName: %s\n", binaryPath, attachFunc)
+	p.logger.Info().Str("binrayPath", binrayPath).Str("Function", attachFunc).Msg("Postgres probe setup")
 
-	this.bpfManagerOptions = manager.Options{
+	p.bpfManagerOptions = manager.Options{
 		DefaultKProbeMaxActive: 512,
 
 		VerifierOptions: ebpf.CollectionOptions{
@@ -147,33 +153,37 @@ func (this *MPostgresProbe) setupManagers() error {
 	return nil
 }
 
-func (this *MPostgresProbe) DecodeFun(em *ebpf.Map) (event.IEventStruct, bool) {
-	fun, found := this.eventFuncMaps[em]
+func (p *MPostgresProbe) DecodeFun(em *ebpf.Map) (event.IEventStruct, bool) {
+	fun, found := p.eventFuncMaps[em]
 	return fun, found
 }
 
-func (this *MPostgresProbe) initDecodeFun() error {
+func (p *MPostgresProbe) initDecodeFun() error {
 	// postgresEventsMap to hook
-	postgresEventsMap, found, err := this.bpfManager.GetMap("events")
+	postgresEventsMap, found, err := p.bpfManager.GetMap("events")
 	if err != nil {
 		return err
 	}
 	if !found {
 		return errors.New("cant found map: events")
 	}
-	this.eventMaps = append(this.eventMaps, postgresEventsMap)
-	this.eventFuncMaps[postgresEventsMap] = &event.PostgresEvent{}
+	p.eventMaps = append(p.eventMaps, postgresEventsMap)
+	p.eventFuncMaps[postgresEventsMap] = &event.PostgresEvent{}
 
 	return nil
 }
 
-func (this *MPostgresProbe) Events() []*ebpf.Map {
-	return this.eventMaps
+func (p *MPostgresProbe) Events() []*ebpf.Map {
+	return p.eventMaps
 }
 
 func init() {
+	RegisteFunc(NewPostgresProbe)
+}
+
+func NewPostgresProbe() IModule {
 	mod := &MPostgresProbe{}
 	mod.name = ModuleNamePostgres
 	mod.mType = ProbeTypeUprobe
-	Register(mod)
+	return mod
 }

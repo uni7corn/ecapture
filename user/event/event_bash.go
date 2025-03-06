@@ -18,77 +18,81 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-
-	"golang.org/x/sys/unix"
 )
 
 /*
- u32 pid;
- u8 line[MAX_DATE_SIZE_BASH];
- u32 Retval;
- char Comm[TASK_COMM_LEN];
+  u8 type;
+  u32 pid;
+  u32 uid;
+  u8 line[MAX_DATA_SIZE_BASH];
+  u32 retval;
+  char comm[TASK_COMM_LEN];
 */
 
 const MaxDataSizeBash = 256
 
 type BashEvent struct {
-	event_type EventType
-	Pid        uint32                 `json:"pid"`
-	Uid        uint32                 `json:"uid"`
-	Line       [MaxDataSizeBash]uint8 `json:"line"`
-	Retval     uint32                 `json:"Retval"`
-	Comm       [16]byte               `json:"Comm"`
+	eventType   EventType
+	BashType    uint32                 `json:"bash_type"`
+	Pid         uint32                 `json:"pid"`
+	Uid         uint32                 `json:"uid"`
+	Line        [MaxDataSizeBash]uint8 `json:"line"`
+	ReturnValue uint32                 `json:"ret_val"`
+	Comm        [16]byte               `json:"Comm"`
+	AllLines    string
 }
 
-func (this *BashEvent) Decode(payload []byte) (err error) {
+func (be *BashEvent) Decode(payload []byte) (err error) {
 	buf := bytes.NewBuffer(payload)
-	if err = binary.Read(buf, binary.LittleEndian, &this.Pid); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &be.BashType); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Uid); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &be.Pid); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Line); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &be.Uid); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Retval); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &be.Line); err != nil {
 		return
 	}
-	if err = binary.Read(buf, binary.LittleEndian, &this.Comm); err != nil {
+	if err = binary.Read(buf, binary.LittleEndian, &be.ReturnValue); err != nil {
 		return
 	}
-
+	if err = binary.Read(buf, binary.LittleEndian, &be.Comm); err != nil {
+		return
+	}
 	return nil
 }
 
-func (this *BashEvent) String() string {
-	s := fmt.Sprintf(fmt.Sprintf("PID:%d, UID:%d, \tComm:%s, \tRetvalue:%d, \tLine:\n%s", this.Pid, this.Uid, this.Comm, this.Retval, unix.ByteSliceToString((this.Line[:]))))
+func (be *BashEvent) String() string {
+	s := fmt.Sprintf("PID:%d, UID:%d, \tComm:%s, \tRetvalue:%d, \tLine:\n%s", be.Pid, be.Uid, be.Comm, be.ReturnValue, be.AllLines)
 	return s
 }
 
-func (this *BashEvent) StringHex() string {
-	s := fmt.Sprintf(fmt.Sprintf("PID:%d, UID:%d, \tComm:%s, \tRetvalue:%d, \tLine:\n%s,", this.Pid, this.Uid, this.Comm, this.Retval, dumpByteSlice([]byte(unix.ByteSliceToString((this.Line[:]))), "")))
+func (be *BashEvent) StringHex() string {
+	s := fmt.Sprintf("PID:%d, UID:%d, \tComm:%s, \tRetvalue:%d, \tLine:\n%s,", be.Pid, be.Uid, be.Comm, be.ReturnValue, dumpByteSlice([]byte(be.AllLines), ""))
 	return s
 }
 
-func (this *BashEvent) Clone() IEventStruct {
+func (be *BashEvent) Clone() IEventStruct {
 	event := new(BashEvent)
-	event.event_type = EventTypeOutput
+	event.eventType = EventTypeModuleData
 	return event
 }
 
-func (this *BashEvent) EventType() EventType {
-	return this.event_type
+func (be *BashEvent) EventType() EventType {
+	return be.eventType
 }
 
-func (this *BashEvent) GetUUID() string {
-	return fmt.Sprintf("%d_%d_%s", this.Pid, this.Uid, this.Comm)
+func (be *BashEvent) GetUUID() string {
+	return fmt.Sprintf("%d_%d_%s", be.Pid, be.Uid, be.Comm)
 }
 
-func (this *BashEvent) Payload() []byte {
-	return this.Line[:]
+func (be *BashEvent) Payload() []byte {
+	return be.Line[:]
 }
 
-func (this *BashEvent) PayloadLen() int {
-	return len(this.Line)
+func (be *BashEvent) PayloadLen() int {
+	return len(be.Line)
 }

@@ -16,11 +16,14 @@
 # Dependency directories (remove the comment below to include it)
 # vendor/
 /assets/ebpf_probe.go
+/assets/ebpf_probe_core.go
+/assets/ebpf_probe_noncore.go
 
 # VSCode
 .vscode/settings.json
 
-kern/bpf/x86/vmlinux.h
+#idea
+.idea/*
 
 bin/*
 /.check*

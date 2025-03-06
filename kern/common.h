@@ -26,10 +26,21 @@
 #endif
 
 #define TASK_COMM_LEN 16
-#define MAX_DATA_SIZE_OPENSSL 1024 * 4
+#define PATH_MAX_LEN 256
+
+/* 
+ * RFC 5246 : https://datatracker.ietf.org/doc/html/rfc5246#section-6.2
+ * length
+ *    The length (in bytes) of the following TLSPlaintext.fragment.  The length MUST NOT exceed 2^14.
+ * 
+ * OpenSSL : SSL3_RT_MAX_PLAIN_LENGTH (16384). These functions will only accept a value in the range 512 - SSL3_RT_MAX_PLAIN_LENGTH.
+ * https://docs.openssl.org/1.1.1/man3/SSL_CTX_set_split_send_fragment/#description
+*/
+#define MAX_DATA_SIZE_OPENSSL 1024 * 16
 #define MAX_DATA_SIZE_MYSQL 256
 #define MAX_DATA_SIZE_POSTGRES 256
 #define MAX_DATA_SIZE_BASH 256
+#define MAX_DATA_SIZE_ZSH 256
 
 // enum_server_command, via
 // https://dev.mysql.com/doc/internals/en/com-query.html COM_QUERT command 03
@@ -37,24 +48,35 @@
 
 #define AF_INET 2
 #define AF_INET6 10
-#define SA_DATA_LEN 14
 #define BASH_ERRNO_DEFAULT 128
 
+#define BASH_EVENT_TYPE_READLINE 0
+#define BASH_EVENT_TYPE_RETVAL 1
+#define BASH_EVENT_TYPE_EXIT_OR_EXEC 2
+#define ZSH_EVENT_TYPE_READLINE 4
 ///////// for TC & XDP ebpf programs in tc.h
 #define TC_ACT_OK 0
 #define ETH_P_IP 0x0800 /* Internet Protocol packet        */
+#define ETH_P_IPV6 0x86DD
 #define SKB_MAX_DATA_SIZE 2048
 
 // .rodata section bug via : https://github.com/gojue/ecapture/issues/39
 #ifndef KERNEL_LESS_5_2
-// alawyse, we used it in tc.h
-const volatile u64 target_port = 443;
 
 // Optional Target PID and UID
 const volatile u64 target_pid = 0;
 const volatile u64 target_uid = 0;
 const volatile u64 target_errno = BASH_ERRNO_DEFAULT;
 #else
+#endif
+
+// fix  4.19.91-27.7.al7.x86_64/source/include/linux/kernel.h:140:9: warning: 'roundup' macro redefined
+#ifndef roundup
+#define roundup(x, y)                    \
+    ({                                   \
+        typeof(y) __y = y;               \
+        (((x) + (__y - 1)) / __y) * __y; \
+    })
 #endif
 
 char __license[] SEC("license") = "Dual MIT/GPL";

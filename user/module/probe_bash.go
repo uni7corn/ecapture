@@ -17,16 +17,24 @@ package module
 import (
 	"bytes"
 	"context"
-	"ecapture/assets"
-	"ecapture/user/config"
-	"ecapture/user/event"
 	"errors"
 	"fmt"
+	"github.com/gojue/ecapture/assets"
+	"github.com/gojue/ecapture/user/config"
+	"github.com/gojue/ecapture/user/event"
+	"github.com/rs/zerolog"
+	"io"
+	"math"
+
 	"github.com/cilium/ebpf"
 	manager "github.com/gojue/ebpfmanager"
 	"golang.org/x/sys/unix"
-	"log"
-	"math"
+)
+
+const (
+	BashEventTypeReadline   = 0
+	BashEventTypeRetval     = 1
+	BashEventTypeExitOrExec = 2
 )
 
 type MBashProbe struct {
@@ -35,50 +43,57 @@ type MBashProbe struct {
 	bpfManagerOptions manager.Options
 	eventFuncMaps     map[*ebpf.Map]event.IEventStruct
 	eventMaps         []*ebpf.Map
+	lineMap           map[string]string
 }
 
 // 对象初始化
-func (this *MBashProbe) Init(ctx context.Context, logger *log.Logger, conf config.IConfig) error {
-	this.Module.Init(ctx, logger, conf)
-	this.conf = conf
-	this.Module.SetChild(this)
-	this.eventMaps = make([]*ebpf.Map, 0, 2)
-	this.eventFuncMaps = make(map[*ebpf.Map]event.IEventStruct)
+func (b *MBashProbe) Init(ctx context.Context, logger *zerolog.Logger, conf config.IConfig, ecw io.Writer) error {
+	err := b.Module.Init(ctx, logger, conf, ecw)
+	if err != nil {
+		return err
+	}
+	b.conf = conf
+	b.Module.SetChild(b)
+	b.eventMaps = make([]*ebpf.Map, 0, 2)
+	b.eventFuncMaps = make(map[*ebpf.Map]event.IEventStruct)
+	b.lineMap = make(map[string]string)
 	return nil
 }
 
-func (this *MBashProbe) Start() error {
-	if err := this.start(); err != nil {
+func (b *MBashProbe) Start() error {
+	if err := b.start(); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (this *MBashProbe) start() error {
+func (b *MBashProbe) start() error {
 
 	// fetch ebpf assets
-	var bpfFileName = this.geteBPFName("user/bytecode/bash_kern.o")
-	this.logger.Printf("%s\tBPF bytecode filename:%s\n", this.Name(), bpfFileName)
+	var bpfFileName = b.geteBPFName("user/bytecode/bash_kern.o")
+	b.logger.Info().Str("bpfFileName", bpfFileName).Msg("BPF bytecode file is matched.")
 	byteBuf, err := assets.Asset(bpfFileName)
+
 	if err != nil {
+		b.logger.Error().Err(err).Strs("bytecode files", assets.AssetNames()).Msg("couldn't find bpf bytecode file")
 		return fmt.Errorf("couldn't find asset %v", err)
 	}
 
 	// setup the managers
-	this.setupManagers()
+	b.setupManagers()
 
 	// initialize the bootstrap manager
-	if err = this.bpfManager.InitWithOptions(bytes.NewReader(byteBuf), this.bpfManagerOptions); err != nil {
+	if err = b.bpfManager.InitWithOptions(bytes.NewReader(byteBuf), b.bpfManagerOptions); err != nil {
 		return fmt.Errorf("couldn't init manager %v ", err)
 	}
 
 	// start the bootstrap manager
-	if err = this.bpfManager.Start(); err != nil {
+	if err = b.bpfManager.Start(); err != nil {
 		return fmt.Errorf("couldn't start bootstrap manager %v ", err)
 	}
 
 	// 加载map信息，map对应events decode表。
-	err = this.initDecodeFun()
+	err = b.initDecodeFun()
 	if err != nil {
 		return err
 	}
@@ -86,68 +101,71 @@ func (this *MBashProbe) start() error {
 	return nil
 }
 
-func (this *MBashProbe) Close() error {
-	if err := this.bpfManager.Stop(manager.CleanAll); err != nil {
+func (b *MBashProbe) Close() error {
+	if err := b.bpfManager.Stop(manager.CleanAll); err != nil {
 		return fmt.Errorf("couldn't stop manager %v ", err)
 	}
-	return this.Module.Close()
+	return b.Module.Close()
 }
 
 // 通过elf的常量替换方式传递数据
-func (this *MBashProbe) constantEditor() []manager.ConstantEditor {
+func (b *MBashProbe) constantEditor() []manager.ConstantEditor {
 	var editor = []manager.ConstantEditor{
 		{
 			Name:  "target_pid",
-			Value: uint64(this.conf.GetPid()),
+			Value: uint64(b.conf.GetPid()),
 			//FailOnMissing: true,
 		},
 		{
 			Name:  "target_uid",
-			Value: uint64(this.conf.GetUid()),
+			Value: uint64(b.conf.GetUid()),
 			//FailOnMissing: true,
 		},
 		{
 			Name:  "target_errno",
-			Value: uint64(this.Module.conf.(*config.BashConfig).ErrNo),
+			Value: uint64(b.Module.conf.(*config.BashConfig).ErrNo),
 		},
 	}
 
-	if this.conf.GetPid() <= 0 {
-		this.logger.Printf("%s\ttarget all process. \n", this.Name())
+	if b.conf.GetPid() <= 0 {
+		b.logger.Info().Msg("target all process.")
 	} else {
-		this.logger.Printf("%s\ttarget PID:%d \n", this.Name(), this.conf.GetPid())
+		b.logger.Info().Uint64("target PID", b.conf.GetPid()).Send()
 	}
 
-	if this.conf.GetUid() <= 0 {
-		this.logger.Printf("%s\ttarget all users. \n", this.Name())
+	if b.conf.GetUid() <= 0 {
+		b.logger.Info().Msg("target all users.")
 	} else {
-		this.logger.Printf("%s\ttarget UID:%d \n", this.Name(), this.conf.GetUid())
+		b.logger.Info().Uint64("target UID", b.conf.GetUid()).Send()
 	}
 
 	return editor
 }
 
-func (this *MBashProbe) setupManagers() {
+func (b *MBashProbe) setupManagers() {
 	var binaryPath string
-	switch this.conf.(*config.BashConfig).ElfType {
+	switch b.conf.(*config.BashConfig).ElfType {
 	case config.ElfTypeBin:
-		binaryPath = this.conf.(*config.BashConfig).Bashpath
+		binaryPath = b.conf.(*config.BashConfig).Bashpath
 	case config.ElfTypeSo:
-		binaryPath = this.conf.(*config.BashConfig).Readline
+		binaryPath = b.conf.(*config.BashConfig).Readline
 	default:
 		binaryPath = "/bin/bash"
 	}
 
-	this.logger.Printf("%s\tHOOK binrayPath:%s, FunctionName:readline\n", this.Name(), binaryPath)
-	this.logger.Printf("%s\tHOOK binrayPath:%s, FunctionName:execute_command\n", this.Name(), binaryPath)
+	var readlineFuncName string // 将默认hook函数改为readline_internal_teardown说明：https://github.com/gojue/ecapture/pull/479
+	readlineFuncName = b.conf.(*config.BashConfig).ReadlineFuncName
 
-	this.bpfManager = &manager.Manager{
+	b.logger.Info().Str("binaryPath", binaryPath).Str("readlineFuncName", readlineFuncName).
+		Str("execute_command", readlineFuncName).Str("exit_builtin", readlineFuncName).
+		Str("exec_builtin", readlineFuncName).Msg("Hook Info")
+	b.bpfManager = &manager.Manager{
 		Probes: []*manager.Probe{
 			{
 				Section:          "uretprobe/bash_readline",
 				EbpfFuncName:     "uretprobe_bash_readline",
-				AttachToFuncName: "readline",
-				//UprobeOffset: 0x8232, 	//若找不到 readline 函数，则使用offset便宜地址方式。
+				AttachToFuncName: readlineFuncName,
+				//UAddress: 0x8232, 	//若找不到 readline 函数，则使用offset偏移地址方式。
 				BinaryPath: binaryPath, // 可能是 /bin/bash 也可能是 readline.so的真实地址
 			},
 			{
@@ -155,6 +173,18 @@ func (this *MBashProbe) setupManagers() {
 				EbpfFuncName:     "uretprobe_bash_retval",
 				AttachToFuncName: "execute_command",
 				BinaryPath:       binaryPath, // 可能是 /bin/bash 也可能是 readline.so的真实地址
+			},
+			{
+				Section:          "uprobe/exec_builtin",
+				EbpfFuncName:     "uprobe_exec_builtin",
+				AttachToFuncName: "exec_builtin",
+				BinaryPath:       binaryPath,
+			},
+			{
+				Section:          "uprobe/exit_builtin",
+				EbpfFuncName:     "uprobe_exit_builtin",
+				AttachToFuncName: "exit_builtin",
+				BinaryPath:       binaryPath,
 			},
 		},
 
@@ -165,7 +195,7 @@ func (this *MBashProbe) setupManagers() {
 		},
 	}
 
-	this.bpfManagerOptions = manager.Options{
+	b.bpfManagerOptions = manager.Options{
 		DefaultKProbeMaxActive: 512,
 
 		VerifierOptions: ebpf.CollectionOptions{
@@ -180,42 +210,93 @@ func (this *MBashProbe) setupManagers() {
 		},
 	}
 
-	if this.conf.EnableGlobalVar() {
+	if b.conf.EnableGlobalVar() {
 		// 填充 RewriteContants 对应map
-		this.bpfManagerOptions.ConstantEditors = this.constantEditor()
+		b.bpfManagerOptions.ConstantEditors = b.constantEditor()
 	}
 
 }
 
-func (this *MBashProbe) DecodeFun(em *ebpf.Map) (event.IEventStruct, bool) {
-	fun, found := this.eventFuncMaps[em]
+func (b *MBashProbe) DecodeFun(em *ebpf.Map) (event.IEventStruct, bool) {
+	fun, found := b.eventFuncMaps[em]
 	return fun, found
 }
 
-func (this *MBashProbe) initDecodeFun() error {
+func (b *MBashProbe) initDecodeFun() error {
 	//bashEventsMap 与解码函数映射
-	bashEventsMap, found, err := this.bpfManager.GetMap("events")
+	bashEventsMap, found, err := b.bpfManager.GetMap("events")
 	if err != nil {
 		return err
 	}
 	if !found {
 		return errors.New("cant found map:events")
 	}
-	this.eventMaps = append(this.eventMaps, bashEventsMap)
+	b.eventMaps = append(b.eventMaps, bashEventsMap)
 	bashevent := &event.BashEvent{}
-	//bashevent.SetModule(this)
-	this.eventFuncMaps[bashEventsMap] = bashevent
+	//bashevent.SetModule(b)
+	b.eventFuncMaps[bashEventsMap] = bashevent
 
 	return nil
 }
 
-func (this *MBashProbe) Events() []*ebpf.Map {
-	return this.eventMaps
+func (b *MBashProbe) Events() []*ebpf.Map {
+	return b.eventMaps
+}
+
+func (b *MBashProbe) Dispatcher(eventStruct event.IEventStruct) {
+	be, ok := eventStruct.(*event.BashEvent)
+	if !ok {
+		return
+	}
+	b.handleLine(be)
+}
+
+func (b *MBashProbe) handleLine(be *event.BashEvent) {
+	switch be.BashType {
+	case BashEventTypeReadline:
+		newline := unix.ByteSliceToString((be.Line[:]))
+		line := b.lineMap[be.GetUUID()]
+		if line != "" {
+			line += "\n" + newline
+		} else {
+			line += newline
+		}
+		b.lineMap[be.GetUUID()] = line
+		return
+	case BashEventTypeRetval:
+		line := b.lineMap[be.GetUUID()]
+		delete(b.lineMap, be.GetUUID())
+		if line == "" || be.ReturnValue == uint32(BashErrnoDefault) {
+			return
+		}
+		be.AllLines = line
+	case BashEventTypeExitOrExec:
+		line := b.lineMap[be.GetUUID()]
+		delete(b.lineMap, be.GetUUID())
+		if line == "" {
+			return
+		}
+		be.ReturnValue = BashEventTypeExitOrExec // we do not know the return value here
+		be.AllLines = line
+	default:
+		return
+	}
+	if b.conf.GetHex() {
+		//b.logger.Println(be.StringHex())
+		_, _ = b.eventCollector.Write([]byte(be.StringHex()))
+	} else {
+		//b.logger.Println(be.String())
+		_, _ = b.eventCollector.Write([]byte(be.String()))
+	}
 }
 
 func init() {
+	RegisteFunc(NewBashProbe)
+}
+
+func NewBashProbe() IModule {
 	mod := &MBashProbe{}
 	mod.name = ModuleNameBash
 	mod.mType = ProbeTypeUprobe
-	Register(mod)
+	return mod
 }
